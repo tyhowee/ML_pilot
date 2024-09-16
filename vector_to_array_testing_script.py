@@ -13,6 +13,7 @@ from typing import Tuple, Dict, Any, List
 
 from tkinter import Tk
 from tkinter.filedialog import askopenfilenames
+from tkinter import simpledialog
 from tkinter import Tk, Toplevel, Button, Checkbutton, IntVar, Label, Frame, filedialog
 
 
@@ -88,23 +89,31 @@ def process_chunk(chunk, gdf, sindex, feature_column, category_to_int, filename_
     for idx, cell in chunk:
         i, j = divmod(idx, grid_size[1])
         possible_matches_index = list(sindex.intersection(cell.bounds))
+        
         if not possible_matches_index:
+            # No intersecting features, return NaN for no data
             results.append((i, j, np.nan))
             continue
 
+        # Check for actual intersection and assign the feature value
         possible_matches = gdf.iloc[possible_matches_index]
         if possible_matches.empty:
             results.append((i, j, np.nan))
             continue
 
+        # Calculate intersections more precisely
         intersections = possible_matches.geometry.intersection(cell)
+
+        # Consider all non-zero intersections
         valid_intersections = intersections[intersections.area > 0]
 
         if valid_intersections.empty:
             results.append((i, j, np.nan))
             continue
 
-        if len(valid_intersections) > 5:
+        # Determine strategy based on the number of intersecting features
+        if len(valid_intersections) > 5:  # Threshold for choosing strategy
+            # Many small polygons: Sum the areas for each unique category
             areas_per_category = {}
             for idx, intersection in enumerate(valid_intersections):
                 if not intersection.is_empty:
@@ -114,12 +123,15 @@ def process_chunk(chunk, gdf, sindex, feature_column, category_to_int, filename_
                         areas_per_category[category_key] = 0
                     areas_per_category[category_key] += intersection.area
 
+            # Choose the category with the largest cumulative area
             if areas_per_category:
                 max_category = max(areas_per_category, key=areas_per_category.get)
                 results.append((i, j, category_to_int[max_category]))
             else:
-                results.append((i, j, np.nan))
+                results.append((i, j, np.nan))  # Fallback to NaN
+
         else:
+            # Few large polygons: Choose the largest single intersection by area
             largest_intersection_idx = valid_intersections.area.idxmax()
             category = possible_matches.loc[largest_intersection_idx, feature_column]
             results.append((i, j, category_to_int[f"{filename_prefix}_{category}"]))
@@ -258,8 +270,22 @@ def compute_grid_size(geojson_file: str, short_edge_cells: int = 1200) -> Tuple[
 
     return grid_size
 
+
+# Prompt the user for the short_edge_cells value using tkinter
+root = Tk()
+root.withdraw()  # Hide the root window
+
+# Ask the user for the short edge size
+short_edge_cells = simpledialog.askinteger("Input", "Enter the number of cells for the short edge:", minvalue=1)
+
+root.destroy()  # Close the tkinter root window
+
+if short_edge_cells is None:
+    raise ValueError("You must enter a valid number for the short edge size.")
+
+
 mask_file = r"C:\Users\TyHow\Documents\3. Work\GIS Stuff\ML_pilot_data\MASK.geojson"
-grid_size = compute_grid_size(mask_file, short_edge_cells=10)[::-1]
+grid_size = compute_grid_size(mask_file, short_edge_cells=short_edge_cells)[::-1]
 print(f"Calculated grid size: {grid_size}")
 
 # %%
@@ -290,8 +316,13 @@ def plot_layers_with_slider(feature_grids, grid_3d):
     # Initial layer index
     layer_index = 0
 
-    # Plot the initial layer
-    im = ax.imshow(grid_3d[layer_index], cmap='tab20', interpolation='nearest', aspect='auto')
+    # Determine the global min and max values across all layers for consistent color scaling
+    global_min = np.nanmin(grid_3d)
+    global_max = np.nanmax(grid_3d)
+
+    # Plot the initial layer with consistent color normalization
+    im = ax.imshow(grid_3d[layer_index], cmap='tab20', interpolation='nearest', aspect='auto',
+                   vmin=global_min, vmax=global_max)
     title = ax.set_title(f"Layer {layer_index + 1}: {list(feature_grids.keys())[layer_index]}")
     plt.colorbar(im, ax=ax, label='Classes')
 
@@ -306,7 +337,6 @@ def plot_layers_with_slider(feature_grids, grid_3d):
         layer = int(layer_slider.val)
         im.set_data(grid_3d[layer])
         title.set_text(f"Layer {layer + 1}: {list(feature_grids.keys())[layer]}")
-        ax.set_title(f"Layer {layer + 1}: {list(feature_grids.keys())[layer]}")
         fig.canvas.draw_idle()
 
     # Connect the slider to the update function
@@ -317,5 +347,6 @@ def plot_layers_with_slider(feature_grids, grid_3d):
 
 # Call the visualization function
 plot_layers_with_slider(feature_grids, grid_3d)
+
 
 
