@@ -1,114 +1,41 @@
 # IMPORTS
-import numpy as np
-
+import cupy as cp
+import cudf
+import numpy
+from cuspatial import cuspatial
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
-
 import os
-
-import geopandas as gpd
-
-from shapely.geometry import box
 from typing import Tuple, Dict, Any, List
+from tkinter import Tk, Toplevel, Button, Checkbutton, IntVar, Label, filedialog, simpledialog
 
-from tkinter import Tk
-from tkinter.filedialog import askopenfilenames
-from tkinter import simpledialog
-from tkinter import Tk, Toplevel, Button, Checkbutton, IntVar, Label, Frame, filedialog
+# RAPIDS GPU-Accelerated Processing Function
 
-
-
-
-from joblib import Parallel, delayed\
-
-#%%
-
-# PARALLEL PROCESSING - CPU - HYBRID - FEATURE SELECTION ENABLED
-
-# Function to prompt the user to select features using tkinter
-def select_features(gdf_dict):
-    """
-    Create a tkinter GUI window to allow the user to select which features to process.
-    """
-    selected_features = {}
-    root = Tk()
-    root.withdraw()  # Hide the root window
-    root.attributes("-topmost", True)  # Bring the dialog to the front
-
-    # Function to create the selection window
-    def create_selection_window():
-        selection_window = Toplevel(root)
-        selection_window.title("Select Features to Process")
-
-        # Store variables for checkboxes
-        feature_vars = {}
-
-        # Create checkboxes for each file and its features
-        for geojson_file, gdf in gdf_dict.items():
-            feature_columns = [col for col in gdf.columns if col != gdf.geometry.name]
-
-            # Extract just the file name from the full path
-            file_name = os.path.basename(geojson_file)
-
-            # Add a frame for each file
-            frame = Label(selection_window, text=f"File: {file_name}")
-            frame.pack(anchor='w', padx=10, pady=5)
-
-            # Create checkboxes for each feature in the file
-            feature_vars[geojson_file] = {}
-            for feature in feature_columns:
-                var = IntVar()
-                checkbutton = Checkbutton(selection_window, text=feature, variable=var)
-                checkbutton.pack(anchor='w')
-                feature_vars[geojson_file][feature] = var
-
-        # Function to handle "OK" button click
-        def on_ok():
-            for geojson_file, features in feature_vars.items():
-                selected_features[geojson_file] = [feature for feature, var in features.items() if var.get() == 1]
-            print("Selected Features Debugging:", selected_features)  # Debugging: print selected features
-            if all(not features for features in selected_features.values()):
-                print("No features were selected.")  # Debugging: Check if no features were selected
-            selection_window.destroy()
-            root.quit()  # Properly close the Tkinter main loop
-
-        # Add an "OK" button
-        Button(selection_window, text="OK", command=on_ok).pack(pady=10)
-
-        selection_window.mainloop()
-
-    create_selection_window()
-    root.destroy()  # Ensure the root window is properly destroyed
-    print("Final Selected Features Debugging:", selected_features)  # Debugging: print final selected features
-    return selected_features
-
-
-# Function to process cells in chunks
-def process_chunk(chunk, gdf, sindex, feature_column, category_to_int, filename_prefix):
+def process_chunk_gpu(chunk, gdf, sindex, feature_column, category_to_int, filename_prefix, grid_size):
     results = []
     for idx, cell in chunk:
         i, j = divmod(idx, grid_size[1])
-        possible_matches_index = list(sindex.intersection(cell.bounds))
+        possible_matches_index = list(sindex.query(cell.bounds))
         
         if not possible_matches_index:
             # No intersecting features, return NaN for no data
-            results.append((i, j, np.nan))
+            results.append((i, j, cp.nan))
             continue
 
         # Check for actual intersection and assign the feature value
         possible_matches = gdf.iloc[possible_matches_index]
         if possible_matches.empty:
-            results.append((i, j, np.nan))
+            results.append((i, j, cp.nan))
             continue
 
         # Calculate intersections more precisely
-        intersections = possible_matches.geometry.intersection(cell)
+        intersections = cuspatial.intersection(possible_matches.geometry, cell)
 
         # Consider all non-zero intersections
         valid_intersections = intersections[intersections.area > 0]
 
         if valid_intersections.empty:
-            results.append((i, j, np.nan))
+            results.append((i, j, cp.nan))
             continue
 
         # Determine strategy based on the number of intersecting features
@@ -128,7 +55,7 @@ def process_chunk(chunk, gdf, sindex, feature_column, category_to_int, filename_
                 max_category = max(areas_per_category, key=areas_per_category.get)
                 results.append((i, j, category_to_int[max_category]))
             else:
-                results.append((i, j, np.nan))  # Fallback to NaN
+                results.append((i, j, cp.nan))  # Fallback to NaN
 
         else:
             # Few large polygons: Choose the largest single intersection by area
@@ -137,26 +64,25 @@ def process_chunk(chunk, gdf, sindex, feature_column, category_to_int, filename_
             results.append((i, j, category_to_int[f"{filename_prefix}_{category}"]))
     return results
 
-# Function to process each feature column
-def process_feature_column(gdf, feature_column, grid_size, target_crs, filename_prefix, x, y):
+# Function to process each feature column using GPU
+def process_feature_column_gpu(gdf, feature_column, grid_size, target_crs, filename_prefix, x, y):
     gdf = gdf.to_crs(target_crs)
-
     unique_categories = gdf[feature_column].unique()
     category_to_int = {f"{filename_prefix}_{cat}": i for i, cat in enumerate(unique_categories)}
 
-    grid = np.full(grid_size, np.nan)
-
-    sindex = gdf.sindex
+    grid = cp.full(grid_size, cp.nan)
+    sindex = gdf.sindex  # RAPIDS Spatial Index
 
     cells = [(idx, box(x[j], y[i], x[j + 1], y[i + 1]))
-             for idx, (i, j) in enumerate(np.ndindex(grid_size))]
+             for idx, (i, j) in enumerate(cp.ndindex(grid_size))]
 
     chunk_size = max(1, len(cells) // 10)
     chunks = [cells[i:i + chunk_size] for i in range(0, len(cells), chunk_size)]
 
-    results = Parallel(n_jobs=-1, backend='loky')(delayed(process_chunk)(
-        chunk, gdf, sindex, feature_column, category_to_int, filename_prefix
-    ) for chunk in chunks)
+    # GPU-parallel processing using RAPIDS
+    results = [process_chunk_gpu(
+        chunk, gdf, sindex, feature_column, category_to_int, filename_prefix, grid_size
+    ) for chunk in chunks]
 
     for result in results:
         for i, j, value in result:
@@ -164,11 +90,11 @@ def process_feature_column(gdf, feature_column, grid_size, target_crs, filename_
 
     return (f"{filename_prefix}_{feature_column}", grid, category_to_int)
 
-# Main function
-def geojson_to_numpy_grid_3d_batch(
+# Main Function using RAPIDS GPU Acceleration
+def geojson_to_numpy_grid_3d_batch_gpu(
     grid_size: Tuple[int, int],  # Grid size for the output array
     target_crs: str = "EPSG:3857"  # Web Mercator projection
-) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[Any, int]], List[Dict[str, Any]]]:
+) -> Tuple[cp.ndarray, Dict[str, cp.ndarray], Dict[str, Dict[Any, int]], List[Dict[str, Any]]]:
     # Use tkinter to select files
     root = Tk()
     root.withdraw()  # Hide the root window
@@ -182,8 +108,8 @@ def geojson_to_numpy_grid_3d_batch(
     if not geojson_files:
         raise ValueError("No files selected. Please select at least one GeoJSON file.")
 
-    # Load all selected files into GeoDataFrames
-    gdf_dict = {geojson_file: gpd.read_file(geojson_file) for geojson_file in geojson_files}
+    # Load all selected files into cuDF DataFrames
+    gdf_dict = {geojson_file: cudf.read_file(geojson_file) for geojson_file in geojson_files}
 
     # Ask the user to select features to process
     selected_features = select_features(gdf_dict)
@@ -199,8 +125,8 @@ def geojson_to_numpy_grid_3d_batch(
         gdf = gdf.to_crs(target_crs)
         minx, miny, maxx, maxy = gdf.total_bounds
 
-        x = np.linspace(minx, maxx, grid_size[1] + 1)
-        y = np.linspace(miny, maxy, grid_size[0] + 1)
+        x = cp.linspace(minx, maxx, grid_size[1] + 1)
+        y = cp.linspace(miny, maxy, grid_size[0] + 1)
 
         feature_columns = selected_features.get(geojson_file, [])
 
@@ -217,9 +143,11 @@ def geojson_to_numpy_grid_3d_batch(
         }
         geospatial_info_list.append(geospatial_info)
 
-        results.extend(Parallel(n_jobs=-1)(delayed(process_feature_column)(
-            gdf, feature_column, grid_size, target_crs, filename_prefix, x, y
-        ) for feature_column in feature_columns))
+        for feature_column in feature_columns:
+            result = process_feature_column_gpu(
+                gdf, feature_column, grid_size, target_crs, filename_prefix, x, y
+            )
+            results.append(result)
 
     for feature_name, grid, category_to_int in results:
         all_feature_grids[feature_name] = grid
@@ -228,9 +156,10 @@ def geojson_to_numpy_grid_3d_batch(
     if not all_feature_grids:
         raise ValueError("No features were processed. Please select at least one feature to process.")
 
-    grid_3d = np.stack(list(all_feature_grids.values()), axis=0)
+    grid_3d = cp.stack(list(all_feature_grids.values()), axis=0)
 
     return grid_3d, all_feature_grids, all_feature_mappings, geospatial_info_list
+
 #%%
 
 # COMPUTE GRID SIZE
