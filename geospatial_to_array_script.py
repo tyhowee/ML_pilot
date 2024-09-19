@@ -274,7 +274,7 @@ def process_feature_column(geojson_file, feature_column, grid_size, target_crs, 
 def geojson_to_numpy_grid_3d_batch(
     grid_size: Tuple[int, int],  # Grid size for the output array
     geojson_files: List[str],  # List of GeoJSON files
-    features_to_process: List[Tuple[str, str]],  # List of (file, feature) tuples to process
+    features_to_process: Dict[str, List[str]],  # Dictionary with filenames as keys and list of features as values
     target_crs: str = "EPSG:3857"  # Web Mercator projection
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[Any, int]], List[Dict[str, Any]]]:
     all_feature_grids = {}
@@ -297,7 +297,7 @@ def geojson_to_numpy_grid_3d_batch(
         y = np.linspace(miny, maxy, grid_size[0] + 1)
 
         # Extract relevant features for this file
-        file_features = [feature for file, feature in features_to_process if file == geojson_file]
+        file_features = features_to_process.get(geojson_file, [])
 
         # Store geospatial information for each file
         geospatial_info = {
@@ -319,6 +319,7 @@ def geojson_to_numpy_grid_3d_batch(
     grid_3d = np.stack(list(all_feature_grids.values()), axis=0)
 
     return grid_3d, all_feature_grids, all_feature_mappings, geospatial_info_list
+
 
 #%%
 
@@ -445,7 +446,7 @@ root.attributes("-topmost", True)  # Bring the file dialog to the front
 # Prompt the user to select a folder to save the files
 output_directory = askdirectory(
     initialdir=r"C:\Users\TyHow\Documents\3. Work\ML_test_area\exports",
-    title="Select a Folder to Save Output Files (BEWARE OVERWRITE!)"
+    title="Select a Folder to Save Output Rasters (BEWARE OVERWRITE!)"
 )
 
 if output_directory:
@@ -474,7 +475,7 @@ root.attributes("-topmost", True)  # Bring the file dialog to the front
 # Prompt the user to select a folder to save the files
 output_directory = askdirectory(
     initialdir=r"C:\Users\TyHow\Documents\3. Work\ML_test_area\exports",
-    title="Select a Folder to Save Output Files (BEWARE OVERWRITE!)"
+    title="Select a Folder to Save Output Vectors (BEWARE OVERWRITE!)"
 )
 
 if output_directory:
@@ -520,7 +521,7 @@ if vector_data.shape[1:] == raster_data.shape[1:]:
     print("Layer Name Mapping List:", combined_layer_names)
 
     # Ensure the combined_data layers match the number of names
-    if len(layer_name_mapping) == combined_data.shape[0]:
+    if len(combined_layer_names) == combined_data.shape[0]:
         print(f"Layer name mapping successful. Total layers: {len(combined_layer_names)}")
     else:
         print(f"Warning: Mismatch in layers. {len(combined_layer_names)} names for {combined_data.shape[0]} layers.")
@@ -530,12 +531,53 @@ else:
 
 # %%
 
+# PLOT COMBINED DATA WITH INTERACTIVE SLIDER
+
+def plot_combined_data_with_slider(combined_data, combined_layer_names):
+    # Create a figure and axis
+    fig, ax = plt.subplots()
+    plt.subplots_adjust(left=0.25, bottom=0.25)
+
+    # Initial plot setup (show the first layer)
+    layer_index = 0
+    current_layer = combined_data[layer_index]
+    img = ax.imshow(current_layer, cmap='viridis')
+    ax.set_title(f"Layer: {combined_layer_names[layer_index]}")
+    ax.set_xlabel('X Coordinate')
+    ax.set_ylabel('Y Coordinate')
+
+    # Define the axes for the slider
+    ax_slider = plt.axes([0.25, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
+
+    # Create a slider that allows for layer selection
+    slider = Slider(ax_slider, 'Layer', 0, combined_data.shape[0] - 1, valinit=layer_index, valstep=1)
+
+    # Function to update the plot when the slider is changed
+    def update(val):
+        layer_index = int(slider.val)
+        current_layer = combined_data[layer_index]
+        img.set_data(current_layer)
+        ax.set_title(f"Layer: {combined_layer_names[layer_index]}")
+        fig.canvas.draw_idle()
+
+    # Attach the update function to the slider
+    slider.on_changed(update)
+
+    # Show the interactive plot
+    plt.show()
+
+# Call the function to plot with slider
+plot_combined_data_with_slider(combined_data, combined_layer_names)
+
+# Once the plot is closed, the script will continue executing
+#%%
+
 # CONVERT TO XARRAY
 
 # Create dummy arrays for X, Y coordinates (you can replace these with your actual coordinates)
 x_coords = np.arange(combined_data.shape[2])  # X-coordinates (along the third axis)
 y_coords = np.arange(combined_data.shape[1])  # Y-coordinates (along the second axis)
-layer_names = [f"Layer_{i}" for i in range(combined_data.shape[0])]  # Layer names
+layer_names = combined_layer_names  # Layer names
 
 # Create an xarray DataArray from the combined NumPy array
 data_xr = xr.DataArray(
