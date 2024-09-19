@@ -2,20 +2,38 @@
 
 from typing import Tuple, Dict, Any, List
 import os
-from tkinter import Tk, filedialog, simpledialog, Toplevel, Button, Checkbutton, IntVar, Label
+from tkinter import Tk, filedialog, simpledialog, Toplevel, Button, Checkbutton, IntVar, Label, Frame
 from tkinter.filedialog import askopenfilenames, askdirectory, asksaveasfilename
 
 import cupy as cp
 import geopandas as gpd
+import hvplot.xarray
+import ipywidgets as widgets
+import matplotlib.colors as mcolors
+from matplotlib.colors import ListedColormap, BoundaryNorm
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 from matplotlib.widgets import Slider
 import numpy as np
+import pandas as pd
+import panel as pn
+from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
+from rasterio.features import rasterize
 import rasterio
 from rasterio.warp import reproject, Resampling
+from scipy import stats
+from scipy.ndimage import generic_filter
+from scipy.stats import mode
+import shapely.geometry as sg
 from shapely.geometry import box
 import xarray as xr
+
+from IPython.display import display
+
 from joblib import Parallel, delayed
+
+import easygui
 
 #%%
 
@@ -218,15 +236,13 @@ def process_feature_column(geojson_file, feature_column, grid_size, target_crs, 
         print(f"GeoDataFrame for {geojson_file} is empty after reprojecting. Skipping column: {feature_column}")
         return None
 
-    # Check if the geometry contains points, and buffer only the point geometries
-    point_mask = gdf.geometry.geom_type == 'Point'
-    
-    if point_mask.any():
-        print("Detected point geometry, applying buffer...")
-        # Apply buffer of 1000 meters to points only
-        gdf.loc[point_mask, 'geometry'] = gdf.loc[point_mask, 'geometry'].buffer(1000)
-    
-    # Process the remaining non-point geometries (e.g., polygons)
+    # Check if the geometry is a point
+    geom_type = gdf.geometry.geom_type.iloc[0]
+
+    if geom_type == "Point" or geom_type == "MultiPoint":
+        print("Detected point geometry, buffering...")
+        gdf["geometry"] = gdf.geometry.buffer(1000)  # Apply a buffer of 1000 meters to points
+
     unique_categories = gdf[feature_column].unique()
     print(f"Unique categories in {feature_column}: {unique_categories}")
     category_to_int = {f"{filename_prefix}_{cat}": i for i, cat in enumerate(unique_categories)}
@@ -253,8 +269,6 @@ def process_feature_column(geojson_file, feature_column, grid_size, target_crs, 
     grid_flipped = np.flipud(grid)
 
     return (f"{filename_prefix}_{feature_column}", grid_flipped, category_to_int)
-
-
 
 # Batch processing function
 def geojson_to_numpy_grid_3d_batch(
@@ -283,7 +297,7 @@ def geojson_to_numpy_grid_3d_batch(
         y = np.linspace(miny, maxy, grid_size[0] + 1)
 
         # Extract relevant features for this file
-        file_features = [feature for file, feature in features_to_process.items() if file == geojson_file]
+        file_features = features_to_process.get(geojson_file, [])
 
         # Store geospatial information for each file
         geospatial_info = {
@@ -296,7 +310,7 @@ def geojson_to_numpy_grid_3d_batch(
         # Use joblib to parallelize the processing of each feature column
         results.extend(Parallel(n_jobs=-1)(delayed(process_feature_column)(
             geojson_file, feature_column, grid_size, target_crs, filename_prefix, x, y
-        ) for feature_column in file_features[0]))
+        ) for feature_column in file_features))
 
     for feature_name, grid, category_to_int in results:
         all_feature_grids[feature_name] = grid
@@ -307,105 +321,181 @@ def geojson_to_numpy_grid_3d_batch(
     return grid_3d, all_feature_grids, all_feature_mappings, geospatial_info_list
 
 
+#%%
 
 #%%
 
-#SELECT/PROCESS RASTERS
+# SELECT/PROCESS RASTERS
 
-#to defined grid with feature mappings
+# CUDA Median Filter for Categorical Rasters
+median_filter_kernel = cp.RawKernel(r'''
+extern "C" __global__
+void median_filter(const float* input, float* output, int width, int height, int window_size) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    int half_window = window_size / 2;
+    float window[1024];
 
-# Get the bounding box of the mask file to use for target transform
+    if (x < width && y < height) {
+        int count = 0;
+        for (int i = -half_window; i <= half_window; ++i) {
+            for (int j = -half_window; j <= half_window; ++j) {
+                int nx = x + j;
+                int ny = y + i;
+                if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                    float val = input[ny * width + nx];
+                    if (!isnan(val)) {
+                        window[count] = val;
+                        count++;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < count - 1; ++i) {
+            for (int j = i + 1; j < count; ++j) {
+                if (window[i] > window[j]) {
+                    float temp = window[i];
+                    window[i] = window[j];
+                    window[j] = temp;
+                }
+            }
+        }
+        if (count > 0) {
+            output[y * width + x] = window[count / 2];
+        } else {
+            output[y * width + x] = __int_as_float(0x7fffffff);
+        }
+    }
+}
+''', 'median_filter')
+
+# Helper Functions for Processing
+def preprocess_data(input_array):
+    input_array = np.array(input_array)
+    input_array = np.where(input_array == "nan", np.nan, input_array)
+    input_array = input_array.astype(np.float32)
+    return input_array
+
+# Processing Categorical Rasters
+def process_categorical_rasters(categorical_raster_files, window_size, grid_size, raster_target_transform, raster_target_crs):
+    categorical_data = []
+    raster_feature_mappings = []
+    
+    for layer_index, raster_file in enumerate(categorical_raster_files):
+        with rasterio.open(raster_file, 'r') as src:
+            print(f"Processing categorical file: {raster_file}")
+            categorical_array = np.full(grid_size, np.nan, dtype=np.float32)
+
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=categorical_array,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=raster_target_transform,
+                dst_crs=raster_target_crs,
+                resampling=Resampling.nearest,
+                dst_nodata=np.nan
+            )
+            preprocessed_data = preprocess_data(categorical_array)
+
+            block_size = (16, 16)
+            smoothed_categorical_data = np.empty_like(preprocessed_data)
+
+            data_layer_gpu = cp.array(preprocessed_data)
+            grid_size_gpu = (
+                (data_layer_gpu.shape[1] + block_size[0] - 1) // block_size[0],
+                (data_layer_gpu.shape[0] + block_size[1] - 1) // block_size[1]
+            )
+            output_gpu = cp.empty_like(data_layer_gpu)
+            median_filter_kernel(grid_size_gpu, block_size, (data_layer_gpu, output_gpu, data_layer_gpu.shape[1], data_layer_gpu.shape[0], window_size))
+            smoothed_layer = cp.asnumpy(output_gpu)
+            smoothed_categorical_data = smoothed_layer
+
+            # Append the processed data and mappings
+            categorical_data.append(smoothed_categorical_data)
+            file_name = os.path.basename(raster_file).replace('.tiff', '').replace('.tif', '')
+            raster_feature_mappings.append((file_name, layer_index))
+    
+    categorical_data = np.stack(categorical_data, axis=0)
+    print(f"Categorical raster stack shape: {categorical_data.shape}")
+    return categorical_data, raster_feature_mappings
+
+# Numerical Raster Processing
+def process_numerical_rasters(numerical_raster_files, grid_size, raster_target_transform, raster_target_crs):
+    numerical_data = []
+    raster_feature_mappings = []
+    
+    for layer_index, raster_file in enumerate(numerical_raster_files):
+        with rasterio.open(raster_file, 'r') as src:
+            print(f"Processing numerical file: {raster_file}")
+            numerical_array = np.full(grid_size, np.nan, dtype=np.float32)
+
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=numerical_array,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=raster_target_transform,
+                dst_crs=raster_target_crs,
+                resampling=Resampling.nearest,
+                dst_nodata=np.nan
+            )
+            numerical_data.append(numerical_array)
+
+            file_name = os.path.basename(raster_file).replace('.tiff', '').replace('.tif', '')
+            raster_feature_mappings.append((file_name, layer_index))
+
+    numerical_data = np.stack(numerical_data, axis=0)
+    print(f"Numerical raster stack shape: {numerical_data.shape}")
+    return numerical_data, raster_feature_mappings
+
+# User Input and File Selection
+def select_rasters_and_window():
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    numerical_raster_files = askopenfilenames(
+        title="Select Numerical Raster Files",
+        filetypes=[("GeoTIFF files", "*.tif"), ("All files", "*.*")]
+    )
+
+    categorical_raster_files = askopenfilenames(
+        title="Select Categorical Raster Files",
+        filetypes=[("GeoTIFF files", "*.tif"), ("All files", "*.*")]
+    )
+
+    window_size = simpledialog.askinteger("Input", "Enter the window size for the batch median filter:", initialvalue=20)
+
+    root.destroy()
+    return numerical_raster_files, categorical_raster_files, window_size
+
+
+numerical_raster_files, categorical_raster_files, window_size = select_rasters_and_window()
+
 raster_gdf = gpd.read_file(mask_file)
 minx, miny, maxx, maxy = raster_gdf.total_bounds
-
-# Convert the GeoDataFrame to a projected CRS
-raster_gdf = raster_gdf.to_crs("EPSG:4326")  # Project to a common projected CRS, e.g., EPSG:3857
-
-# Recalculate bounds in the projected CRS
-minx, miny, maxx, maxy = raster_gdf.total_bounds
-
-# Compute the target transform for the projected CRS
+raster_gdf = raster_gdf.to_crs("EPSG:4326")
 raster_target_transform = from_bounds(minx, miny, maxx, maxy, grid_size[1], grid_size[0])
-raster_target_crs = "EPSG:4326"  # Set the target CRS to a projected coordinate system
+raster_target_crs = "EPSG:4326"
 
-# Open a file selection dialog for the user to select multiple raster files
-root = Tk()
-root.withdraw()  # Hide the root window
-root.attributes("-topmost", True)  # Bring the dialog to the front
+# Process numerical rasters
+numerical_data, numerical_raster_mappings = process_numerical_rasters(numerical_raster_files, grid_size, raster_target_transform, raster_target_crs)
 
-# Open the file selection dialog
-raster_files = askopenfilenames(
-    title="Select Raster Files",
-    filetypes=[("GeoTIFF files", "*.tif"), ("All files", "*.*")]
-)
+# Process categorical rasters
+categorical_data, categorical_raster_mappings = process_categorical_rasters(categorical_raster_files, window_size, grid_size, raster_target_transform, raster_target_crs)
 
-# Lists to store data and corresponding file names
-raster_data = []
-raster_names = []
-raster_feature_mappings = []  # List to store the mappings from filenames to their corresponding layers
+# Combine all layers (vector, numerical, and categorical)
+raster_data = np.concatenate((numerical_data, categorical_data), axis=0)
+raster_feature_mappings = numerical_raster_mappings + categorical_raster_mappings
+raster_names = [os.path.basename(file).replace('.tif', '') for file in numerical_raster_files + categorical_raster_files]
 
-# Now, reproject and resample each raster to the common grid
-for layer_index, raster_file in enumerate(raster_files):
-    with rasterio.open(raster_file, 'r') as src:
-        print(f"Processing file: {raster_file}")
-        print(f"Source CRS: {src.crs}")
-        print(f"Source Transform: {src.transform}")
-        print(f"Source Bounds: {src.bounds}")
+print(f"Combined array shape: {raster_data.shape}")
+print("Layer Name Mapping List:", raster_names)
+print("Raster Feature Mappings:", raster_feature_mappings)
 
-        # Check if the source CRS matches the target CRS; reproject if needed
-        if src.crs != raster_target_crs:
-            src_crs = src.crs
-        else:
-            src_crs = raster_target_crs  # Keep the same CRS if already matching
-        
-        # Prepare the output array with NaN (representing no data)
-        raster_data_array = np.full(grid_size, np.nan, dtype=np.float32)
 
-        # Handle NoData value
-        nodata_value = src.nodata
-        if nodata_value is None:
-            nodata_value = np.nan  # If NoData is not set, assume NaN
-
-        # Print debug information
-        print(f"Reprojecting {raster_file} to target grid...")
-        print(f"Target CRS: {raster_target_crs}")
-        print(f"Target Transform: {raster_target_transform}")
-        print(f"Target Grid Size: {grid_size}")
-
-        # Reproject the source data to the target grid
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=raster_data_array,
-            src_transform=src.transform,
-            src_crs=src_crs,
-            dst_transform=raster_target_transform,
-            dst_crs=raster_target_crs,
-            resampling=Resampling.nearest,
-            src_nodata=nodata_value,
-            dst_nodata=np.nan  # Use NaN as the destination NoData
-        )
-
-        # Append the resampled data and names to lists
-        raster_data.append(raster_data_array)  # Append the resampled data array
-        file_name = os.path.basename(raster_file).replace('.tiff', '').replace('.tif', '')
-        raster_names.append(file_name)
-
-        # Append the filename to feature mappings with its corresponding layer index
-        raster_feature_mappings.append((file_name, layer_index))
-
-# Stack list into a 3D numpy array
-raster_data = np.stack(raster_data, axis=0)  # Stack the list of arrays into a 3D numpy array
-print(raster_data.shape, raster_names)
-print("Feature Mappings:", raster_feature_mappings)  # Print the feature mappings
-
-# Check if all data layers contain NaN
-for i in range(raster_data.shape[0]):
-    print(f"Layer {i} ({raster_names[i]}):")
-    if np.all(np.isnan(raster_data[i])):
-        print("  All values are NaN.")
-    else:
-        print(f"  Min value: {np.nanmin(raster_data[i])}")
-        print(f"  Max value: {np.nanmax(raster_data[i])}")
 
 
 #%%
@@ -486,7 +576,7 @@ root.destroy()
 #%%
 
 
-# COMBINE ARRAYS - WITH LAYER NAMES
+#COMBINE ARRAYS - WITH LAYER NAMES
 
 # Combine the arrays (vector and raster)
 if vector_data.shape[1:] == raster_data.shape[1:]:
@@ -496,13 +586,13 @@ if vector_data.shape[1:] == raster_data.shape[1:]:
     # Initialize the layer name mapping list
     combined_layer_names = []
 
-    # Add vector layer names (from feature names in vector_feature_grids) first
-    for vector_feature_name in vector_feature_grids.keys():
-        combined_layer_names.append(vector_feature_name)
-
-    # Add raster layer names (from file names) after the vector layer names
+    # Add raster layer names (from file names)
     for raster_name in raster_names:
         combined_layer_names.append(raster_name)
+
+    # Add vector layer names (from feature names in vector_feature_grids)
+    for vector_feature_name in vector_feature_grids.keys():
+        combined_layer_names.append(vector_feature_name)
 
     # Check the mapping to ensure it is correct
     print("Layer Name Mapping List:", combined_layer_names)
@@ -516,10 +606,9 @@ else:
     print("Error: The x/y dimensions of the arrays do not match.")
 
 
-
 # %%
 
-# PLOT COMBINED DATA WITH INTERACTIVE SLIDER AND UNIQUE COLORS FOR EACH VALUE
+# PLOT COMBINED DATA WITH INTERACTIVE SLIDER
 
 def plot_combined_data_with_slider(combined_data, combined_layer_names):
     # Create a figure and axis
@@ -529,14 +618,7 @@ def plot_combined_data_with_slider(combined_data, combined_layer_names):
     # Initial plot setup (show the first layer)
     layer_index = 0
     current_layer = combined_data[layer_index]
-
-    # Get unique values and create a ListedColormap for the current layer
-    unique_values = np.unique(current_layer[~np.isnan(current_layer)])  # Exclude NaN values
-    cmap = plt.cm.get_cmap('tab20', len(unique_values))  # Create a colormap with the number of unique values
-    norm = plt.Normalize(vmin=min(unique_values), vmax=max(unique_values))  # Normalize for unique values
-
-    # Display the first layer with unique colors
-    img = ax.imshow(current_layer, cmap=cmap, norm=norm)
+    img = ax.imshow(current_layer, cmap='viridis')
     ax.set_title(f"Layer: {combined_layer_names[layer_index]}")
     ax.set_xlabel('X Coordinate')
     ax.set_ylabel('Y Coordinate')
@@ -551,17 +633,7 @@ def plot_combined_data_with_slider(combined_data, combined_layer_names):
     def update(val):
         layer_index = int(slider.val)
         current_layer = combined_data[layer_index]
-
-        # Update the unique values and colormap for the current layer
-        unique_values = np.unique(current_layer[~np.isnan(current_layer)])
-        cmap = plt.cm.get_cmap('tab20', len(unique_values))  # Update colormap
-        norm = plt.Normalize(vmin=min(unique_values), vmax=max(unique_values))  # Update normalization
-
         img.set_data(current_layer)
-        img.set_cmap(cmap)
-        img.set_norm(norm)
-
-        # Update the title and redraw
         ax.set_title(f"Layer: {combined_layer_names[layer_index]}")
         fig.canvas.draw_idle()
 
@@ -575,7 +647,6 @@ def plot_combined_data_with_slider(combined_data, combined_layer_names):
 plot_combined_data_with_slider(combined_data, combined_layer_names)
 
 # Once the plot is closed, the script will continue executing
-
 #%%
 
 # CONVERT TO XARRAY
