@@ -121,41 +121,67 @@ geojson_files = select_geojson_files()
 print(f"Selected GeoJSON files: {geojson_files}")
 
 #SELECT VECTOR FILE LAYERS
-vector_features_to_process = []
+# Function to select features for each GeoJSON file
+def select_columns(gdf_dict):
+    """
+    Create a tkinter GUI window to allow the user to select which columns (features) to process.
+    """
+    selected_features = {}  # To store selected features for each file
+    root = Tk()
+    root.withdraw()  # Hide the root window
+    root.attributes("-topmost", True)  # Bring the dialog to the front
 
-def select_columns(geojson_file):
-    """Function to display column selection widgets for a given GeoJSON file."""
-    # Read the GeoJSON file using GeoPandas
-    gdf = gpd.read_file(geojson_file)
-    
-    # Get the list of columns
-    columns = gdf.columns.tolist()
-    
-    # Create a multiple selection widget for columns
-    selection = widgets.SelectMultiple(
-        options=columns,
-        description=f'Select columns for {os.path.basename(geojson_file)}:',
-        rows=10
-    )
-    
-    # Display the widget and button
-    display(selection)
+    # Function to create the selection window
+    def create_selection_window():
+        selection_window = Toplevel(root)
+        selection_window.title("Select Features to Process")
 
-    # Define button click event
-    def on_button_click(b):
-        # For each selected column, create a tuple of (geojson_file, column_name)
-        selected_columns = [(geojson_file, col) for col in selection.value]
-        vector_features_to_process.extend(selected_columns)
-        print(f'Selected columns from {geojson_file}: {selected_columns}')
-    
-    # Create and display button
-    button = widgets.Button(description="Submit Selection")
-    button.on_click(on_button_click)
-    display(button)
+        # Store variables for checkboxes
+        feature_vars = {}
 
-# Iterate through each GeoJSON file and let the user select columns
-for file in geojson_files:
-    select_columns(file)
+        # Create checkboxes for each file and its features
+        for geojson_file, gdf in gdf_dict.items():
+            feature_columns = [col for col in gdf.columns if col != gdf.geometry.name]
+
+            # Extract just the file name from the full path
+            file_name = os.path.basename(geojson_file)
+
+            # Add a label for each file
+            file_label = Label(selection_window, text=f"File: {file_name}")
+            file_label.pack(anchor='w', padx=10, pady=5)
+
+            # Create checkboxes for each feature in the file
+            feature_vars[geojson_file] = {}
+            for feature in feature_columns:
+                var = IntVar()
+                checkbutton = Checkbutton(selection_window, text=feature, variable=var)
+                checkbutton.pack(anchor='w')
+                feature_vars[geojson_file][feature] = var
+
+        # Function to handle "OK" button click
+        def on_ok():
+            for geojson_file, features in feature_vars.items():
+                selected_features[geojson_file] = [feature for feature, var in features.items() if var.get() == 1]
+            selection_window.destroy()
+            root.quit()  # Properly close the Tkinter main loop
+
+        # Add an "OK" button
+        Button(selection_window, text="OK", command=on_ok).pack(pady=10)
+
+        selection_window.mainloop()
+
+    create_selection_window()
+    root.destroy()  # Ensure the root window is properly destroyed
+    return selected_features
+
+# Load the GeoJSON files into GeoDataFrames
+gdf_dict = {file: gpd.read_file(file) for file in geojson_files}
+
+# Use the function to allow the user to select columns for each file
+vector_features_to_process = select_columns(gdf_dict)
+
+# Print the selected features for verification
+print(f"Selected features to process: {vector_features_to_process}")
 
 #%%
 
