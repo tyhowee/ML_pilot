@@ -373,7 +373,7 @@ for layer_index, raster_file in enumerate(raster_files):
 
         # Append the resampled data and names to lists
         raster_data.append(raster_data_array)  # Append the resampled data array
-        file_name = os.path.basename(raster_file).replace('.tif', '')  # Get file name without extension
+        file_name = os.path.basename(raster_file).replace('.tiff', '').replace('.tif', '')
         raster_names.append(file_name)
 
         # Append the filename to feature mappings with its corresponding layer index
@@ -472,14 +472,32 @@ root.destroy()
 #%%
 
 
-#COMBINE ARRAYS
+#COMBINE ARRAYS - WITH LAYER NAMES
 
-# Ensure the arrays have the same x/y dimensions
+# Combine the arrays (vector and raster)
 if vector_data.shape[1:] == raster_data.shape[1:]:
-    # Combine the arrays along the first axis (layers)
     combined_data = np.concatenate((vector_data, raster_data), axis=0)
-
     print(f"Combined array shape: {combined_data.shape}")
+
+    # Initialize the layer name mapping list
+    combined_layer_names = []
+
+    # Add raster layer names (from file names)
+    for raster_name in raster_names:
+        combined_layer_names.append(raster_name)
+
+    # Add vector layer names (from feature names in vector_feature_grids)
+    for vector_feature_name in vector_feature_grids.keys():
+        combined_layer_names.append(vector_feature_name)
+
+    # Check the mapping to ensure it is correct
+    print("Layer Name Mapping List:", combined_layer_names)
+
+    # Ensure the combined_data layers match the number of names
+    if len(layer_name_mapping) == combined_data.shape[0]:
+        print(f"Layer name mapping successful. Total layers: {len(combined_layer_names)}")
+    else:
+        print(f"Warning: Mismatch in layers. {len(combined_layer_names)} names for {combined_data.shape[0]} layers.")
 else:
     print("Error: The x/y dimensions of the arrays do not match.")
 
