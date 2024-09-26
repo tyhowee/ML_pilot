@@ -161,3 +161,4 @@ cython_debug/
 
 # Datasets file
 example_scripts/tas_sn_w_datasets.zip
+MAP3_adjusted.tif
