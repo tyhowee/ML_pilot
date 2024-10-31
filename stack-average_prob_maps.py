@@ -2,6 +2,7 @@ import rasterio
 import matplotlib.pyplot as plt
 import numpy as np
 import os
+import pandas as pd
 from tkinter import Tk
 from tkinter.filedialog import askopenfilenames, asksaveasfilename
 
@@ -19,28 +20,22 @@ if not file_paths:
     print("No files selected. Exiting.")
     exit()
 
-# Initialize an array to store the sum of the selected TIFF files
-sum_array = None
+# Load all files into a 3D array to calculate pixel-by-pixel statistics
+data_stack = []
 
-# Loop over each selected file and add it to the sum
 for file_path in file_paths:
     with rasterio.open(file_path) as src:
         data = src.read(1)  # Read the first (or only) band of the TIFF
-        
-        # Initialize sum_array with the first file's shape and dtype if not done yet
-        if sum_array is None:
-            sum_array = np.zeros_like(data, dtype=np.float64)  # Use float64 for cumulative sum accuracy
+        data_stack.append(data)
 
-        # Add the current file's data to the sum
-        sum_array += data
+# Convert the list of arrays to a 3D numpy array (stacked along the third dimension)
+data_stack = np.stack(data_stack, axis=2)
 
-# Divide the summed array by the number of selected files to get the average
-average_array = sum_array / len(file_paths)
-
-# Calculate statistics for the averaged array
-min_value = np.min(average_array)
-max_value = np.max(average_array)
-std_dev = np.std(average_array)
+# Calculate pixel-by-pixel statistics
+average_array = np.mean(data_stack, axis=2)
+min_array = np.min(data_stack, axis=2)
+max_array = np.max(data_stack, axis=2)
+std_dev_array = np.std(data_stack, axis=2)
 
 # Prompt the user to select the output file path and name
 output_file = asksaveasfilename(
@@ -53,16 +48,36 @@ if not output_file:
     print("No output file selected. Exiting.")
     exit()
 
-# Save the statistics in the same directory as the output TIFF file
+# Define output directory and base filename
 output_dir = os.path.dirname(output_file)
-stats_file_path = os.path.join(output_dir, "prob_stats.txt")
+base_name = os.path.splitext(os.path.basename(output_file))[0]
 
-with open(stats_file_path, "w") as stats_file:
-    stats_file.write(f"Min Value: {min_value}\n")
-    stats_file.write(f"Max Value: {max_value}\n")
-    stats_file.write(f"Standard Deviation: {std_dev}\n")
+# Save pixel-by-pixel statistics as separate TIFF files
+def save_array_as_tiff(array, filename, template_file):
+    with rasterio.open(template_file) as src:
+        profile = src.profile
+        profile.update(dtype=rasterio.float64)
 
-print(f"Probability map statistics saved to '{stats_file_path}'")
+        with rasterio.open(filename, "w", **profile) as dst:
+            dst.write(array, 1)
+
+# Save averaged probability map as TIFF
+save_array_as_tiff(average_array, output_file, file_paths[0])
+print(f"Averaged probability map saved as '{output_file}'")
+
+# Save min, max, and std deviation as separate TIFF files
+min_tiff_path = os.path.join(output_dir, f"{base_name}_min.tif")
+max_tiff_path = os.path.join(output_dir, f"{base_name}_max.tif")
+std_dev_tiff_path = os.path.join(output_dir, f"{base_name}_std_dev.tif")
+
+save_array_as_tiff(min_array, min_tiff_path, file_paths[0])
+save_array_as_tiff(max_array, max_tiff_path, file_paths[0])
+save_array_as_tiff(std_dev_array, std_dev_tiff_path, file_paths[0])
+
+print(f"Min map saved as '{min_tiff_path}'")
+print(f"Max map saved as '{max_tiff_path}'")
+print(f"Standard deviation map saved as '{std_dev_tiff_path}'")
+
 
 # Plot the averaged probability map----------------------------------------------------------------------
 plt.figure(figsize=(14, 10))
@@ -78,15 +93,3 @@ plt.savefig(png_file_path, format='png')
 print(f"Probability map image saved as '{png_file_path}'")
 
 plt.show()
-
-# Save the averaged array as a new TIFF
-with rasterio.open(
-    file_paths[0]  # Use the first file's metadata as a template
-) as src:
-    profile = src.profile
-    profile.update(dtype=rasterio.float64)
-
-    with rasterio.open(output_file, "w", **profile) as dst:
-        dst.write(average_array, 1)  # Write the result to the first band
-
-print(f"Averaged result saved as '{output_file}'")
