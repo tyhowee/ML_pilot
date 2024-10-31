@@ -71,6 +71,12 @@ plt.colorbar(label='Probability')
 plt.title('Mineral Deposit Probability Map (AVERAGED)', fontsize=15)
 plt.axis('off')
 plt.tight_layout()
+
+# Save the plot as a PNG file with the same name as the output TIFF
+png_file_path = output_file.replace(".tif", ".png")
+plt.savefig(png_file_path, format='png')
+print(f"Probability map image saved as '{png_file_path}'")
+
 plt.show()
 
 # Save the averaged array as a new TIFF
