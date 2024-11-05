@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -35,6 +36,17 @@ df = pd.read_parquet('checker0_df.parquet')
 
 df_test = pd.read_parquet('checker1_df.parquet')
 #df_test.drop('LINE_M61_Centro_FAULTS', axis=1, inplace=True)
+
+# Load metadata from the JSON file
+def load_geo_metadata(metadata_path):
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    return metadata
+
+# Load metadata from the JSON file (assumes metadata is in the same directory)
+main_dir = os.getcwd()  # Since you changed the working directory earlier, use the current working directory
+metadata_path = os.path.join(main_dir, "geo_metadata.json")
+geo_metadata = load_geo_metadata(metadata_path)
 
 #Check which columns are not float
 non_float_columns = df.select_dtypes(exclude=['float64']).columns
@@ -223,7 +235,7 @@ plt.tight_layout()
 plt.show()
 
 
-#EXPORT TIF----------------------------------------------------------------------------------------------
+# EXPORT TIF WITH METADATA----------------------------------------------------------------------------------------------
 
 # Prompt the user to select the destination path and file name
 root = Tk()
@@ -239,14 +251,25 @@ root.destroy()
 
 # Proceed only if a file name was provided
 if output_file:
-    # Save the probability map as a plain TIFF
+    # Extract CRS from metadata
+    crs = geo_metadata.get("crs")
+
+    # Parse transform string to create Affine object
+    transform_str = geo_metadata.get("transform", "")
+    # Clean and split lines to get the transform values
+    transform_values = [float(num) for line in transform_str.replace("|", "").splitlines() for num in line.split(",")]
+    transform = rasterio.Affine(*transform_values[:6])  # Ensure we only take the required six values
+
+    # Save the probability map with geospatial metadata
     with rasterio.open(
         output_file, "w",
         driver="GTiff",
         height=prob_map.shape[0],
         width=prob_map.shape[1],
         count=1,
-        dtype=prob_map.dtype
+        dtype=prob_map.dtype,
+        crs=crs,
+        transform=transform
     ) as dst:
         dst.write(prob_map, 1)
 
