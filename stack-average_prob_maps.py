@@ -2,7 +2,6 @@ import rasterio
 import matplotlib.pyplot as plt
 import numpy as np
 import os
-import pandas as pd
 from tkinter import Tk
 from tkinter.filedialog import askopenfilenames, asksaveasfilename
 
@@ -61,7 +60,7 @@ base_name = os.path.splitext(os.path.basename(output_file))[0]
 def save_array_as_tiff(array, filename, metadata):
     # Update the metadata to reflect the data type and single band
     metadata.update({
-        "dtype": 'float64',
+        "dtype": rasterio.float64,
         "count": 1
     })
 
